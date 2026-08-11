@@ -1,0 +1,35 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dot-rush",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-05-05",
+
+  // public/ 以下を静的アセットとして配信する。
+  // アセットに一致しないパス (/api/*) だけが Worker に渡る。
+  "assets": {
+    "directory": "./public"
+  },
+
+  // ルームごとに 1 つの Durable Object インスタンスが立ち、
+  // そこがゲームの権威サーバー (state + tick loop) になる。
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "GAME_ROOM",
+        "class_name": "GameRoom"
+      }
+    ]
+  },
+
+  // 無料プランでも使える SQLite バックエンドの Durable Object として作成する。
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["GameRoom"]
+    }
+  ],
+
+  "observability": {
+    "enabled": true
+  }
+}
