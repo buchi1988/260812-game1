@@ -17,8 +17,12 @@ export const MAX_PLAYERS = 16;
 /** プレイヤーの見た目・挙動。 */
 export const PLAYER_R = 18;
 export const MAX_SPEED = 260;
-/** 速度の追従係数。大きいほどキビキビ動く (フレームレート非依存)。 */
-export const ACCEL = 14;
+/**
+ * 速度の追従係数。大きいほどキビキビ動く。
+ * 時定数は 1/ACCEL 秒で、キーを離してから滑る距離は MAX_SPEED/ACCEL px。
+ * 45 なら 6px (自分の直径の 1/6) で止まる。
+ */
+export const ACCEL = 45;
 
 /** オーブ (得点アイテム)。 */
 export const ORB_COUNT = 14;

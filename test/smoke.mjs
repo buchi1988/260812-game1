@@ -182,6 +182,137 @@ check('退出した人が名簿から消える', a.roster.length === 1);
 check('残った人への配信は続く', a.last.p.length === 1);
 a.ws.close();
 
+console.log('\n■ 先読みの精度');
+{
+  // クライアントと同じ予測計算をするボットを、実回線相当の遅延を挟んで走らせる。
+  //
+  // サーバーが返す 'me' の et は「この位置はあなたの時計で何時に相当するか」。
+  // 同じ時点の自分の予測と突き合わせた誤差が小さいこと ＝ 予測がサーバーと
+  // 一致していて、通信の遅れをズレと誤認していないこと。
+  // 今の位置と直接比べる (旧方式) と、誤差は往復時間に比例して膨らむ。
+  const RTT = 90;
+  const half = RTT / 2;
+  const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+
+  const cfg = {};
+  let id = null;
+  const self = { x: 0, y: 0, vx: 0, vy: 0, ready: false };
+  const path = [];
+  const errAligned = [];
+  const errNaive = [];
+  let measuring = false;
+  const dir = { x: 0, y: 0 };
+  let lastSent = -1e9;
+  let lastSentDir = { x: 0, y: 0 };
+
+  const sock = new WebSocket(`${WS_BASE}?room=${room('PRED')}&name=${encodeURIComponent('予測')}`);
+
+  const send = () => {
+    if (sock.readyState !== WebSocket.OPEN) return;
+    const now = performance.now();
+    const change = Math.hypot(dir.x - lastSentDir.x, dir.y - lastSentDir.y);
+    const since = now - lastSent;
+    const due = change > 0.3 ? since >= 12 : change > 0.02 ? since >= 33 : since >= 100;
+    if (!due) return;
+    lastSent = now;
+    lastSentDir = { ...dir };
+    const payload = JSON.stringify({ t: 'input', dx: dir.x, dy: dir.y, ts: now });
+    setTimeout(() => sock.readyState === WebSocket.OPEN && sock.send(payload), half);
+  };
+
+  const handle = (msg) => {
+    if (msg.t === 'welcome') {
+      id = msg.id;
+      Object.assign(cfg, msg);
+      return;
+    }
+    if (msg.t === 'state') {
+      const mine = msg.p.find((p) => p[0] === id);
+      if (mine && !self.ready) {
+        self.x = mine[1];
+        self.y = mine[2];
+        self.ready = true;
+      }
+      return;
+    }
+    if (msg.t !== 'me' || !self.ready || path.length === 0 || msg.et < path[0].t) return;
+
+    let past = path[0];
+    for (const e of path) {
+      if (e.t <= msg.et) past = e;
+      else break;
+    }
+    const ex = msg.x - past.x;
+    const ey = msg.y - past.y;
+    if (measuring) {
+      errAligned.push(Math.hypot(ex, ey));
+      errNaive.push(Math.hypot(msg.x - self.x, msg.y - self.y));
+    }
+    const k = Math.hypot(ex, ey) > 170 ? 1 : 0.2;
+    self.x = clamp(self.x + ex * k, cfg.playerR, cfg.world.w - cfg.playerR);
+    self.y = clamp(self.y + ey * k, cfg.playerR, cfg.world.h - cfg.playerR);
+    for (const e of path) {
+      e.x += ex * k;
+      e.y += ey * k;
+    }
+  };
+
+  sock.addEventListener('message', (ev) => {
+    const msg = JSON.parse(ev.data);
+    setTimeout(() => handle(msg), half);
+  });
+
+  let prev = performance.now();
+  const loop = setInterval(() => {
+    const now = performance.now();
+    const dt = Math.min((now - prev) / 1000, 0.05);
+    prev = now;
+    if (self.ready) {
+      // サーバー (movePlayers) と同じ解析解
+      const kk = 1 - Math.exp(-cfg.accel * dt);
+      const tx = dir.x * cfg.speed;
+      const ty = dir.y * cfg.speed;
+      self.x = clamp(self.x + tx * dt + ((self.vx - tx) * kk) / cfg.accel, cfg.playerR, cfg.world.w - cfg.playerR);
+      self.y = clamp(self.y + ty * dt + ((self.vy - ty) * kk) / cfg.accel, cfg.playerR, cfg.world.h - cfg.playerR);
+      self.vx += (tx - self.vx) * kk;
+      self.vy += (ty - self.vy) * kk;
+      path.push({ t: now, x: self.x, y: self.y });
+      if (path.length > 180) path.shift();
+    }
+    send();
+  }, 1000 / 60);
+
+  await sleep(1200);
+  check('welcome で物理パラメータが揃っている', cfg.accel > 0 && cfg.speed > 0 && cfg.playerR > 0);
+
+  const dirs = [
+    [1, 0], [0.7, 0.7], [0, 1], [-0.7, 0.7],
+    [-1, 0], [-0.7, -0.7], [0, -1], [0.7, -0.7],
+  ];
+  measuring = true;
+  for (let i = 0; i < 12; i++) {
+    dir.x = dirs[i % dirs.length][0];
+    dir.y = dirs[i % dirs.length][1];
+    await sleep(600);
+  }
+  measuring = false;
+  clearInterval(loop);
+  sock.close();
+
+  const avg = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+  check('サーバーが me メッセージを返している', errAligned.length > 20, `${errAligned.length} 件`);
+  check(
+    `往復 ${RTT}ms でも予測がサーバーと一致する`,
+    avg(errAligned) < 5,
+    `平均 ${avg(errAligned).toFixed(1)}px`
+  );
+  check(
+    '今の位置と直接比べる方式より誤差が小さい',
+    avg(errAligned) < avg(errNaive) / 2,
+    `同時点 ${avg(errAligned).toFixed(1)}px < 現在位置 ${avg(errNaive).toFixed(1)}px`
+  );
+}
+
 console.log('\n■ 定員');
 const capRoom = room('CAP');
 const sockets = [];

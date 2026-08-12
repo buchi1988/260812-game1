@@ -37,6 +37,12 @@ interface Player {
   score: number;
   /** 得点した瞬間の時刻。クライアント側の演出に使う */
   lastScoreAt: number;
+  /**
+   * このプレイヤーの時計とサーバーの時計の差 (ms)。
+   * 入力に添えられた送信時刻と到着時刻から求める。
+   * 「今のサーバーの状態は、あなたの時計で何時に相当するか」を伝えるのに使う。
+   */
+  clockOffset: number | null;
 }
 
 interface Orb {
@@ -119,6 +125,7 @@ export class GameRoom extends DurableObject<Env> {
       iy: 0,
       score: 0,
       lastScoreAt: 0,
+      clockOffset: null,
     };
     const session: Session = { ws: server, player };
     this.sessions.set(server, session);
@@ -176,6 +183,17 @@ export class GameRoom extends DurableObject<Env> {
         }
         session.player.ix = dx;
         session.player.iy = dy;
+
+        // 送信時刻が添えてあれば、時計の差を測る。
+        // 遅れて届いた分だけ差は大きく出るので、観測した最小値を追いかける
+        // (回線が本当に遅くなったときのために、少しずつ上げる余地は残す)。
+        const ts = Number(data.ts);
+        if (Number.isFinite(ts)) {
+          const offset = Date.now() - ts;
+          const current = session.player.clockOffset;
+          session.player.clockOffset =
+            current === null ? offset : Math.min(offset, current + 0.5);
+        }
         break;
       }
       case 'ping': {
@@ -254,14 +272,25 @@ export class GameRoom extends DurableObject<Env> {
     this.fx.length = 0;
   }
 
+  /**
+   * 速度は目標値へ指数的に追従させ、その間の移動距離は解析解で求める。
+   *
+   *   k  = 1 - exp(-ACCEL * dt)
+   *   dx = 目標速度 * dt + (今の速度 - 目標速度) * k / ACCEL
+   *
+   * 「更新後の速度 × dt」で済ませると刻み幅によって進む距離が変わってしまい、
+   * 20Hz のサーバーと 60fps のクライアントで結果が食い違う。この式なら
+   * dt がいくつでも厳密に同じ位置になるので、両者の予測が一致する。
+   */
   private movePlayers(dt: number): void {
-    // 指数補間なので tick 間隔が揺れても挙動が変わらない。
     const k = 1 - Math.exp(-ACCEL * dt);
     for (const { player: p } of this.sessions.values()) {
-      p.vx += (p.ix * MAX_SPEED - p.vx) * k;
-      p.vy += (p.iy * MAX_SPEED - p.vy) * k;
-      p.x = clamp(p.x + p.vx * dt, PLAYER_R, WORLD_W - PLAYER_R);
-      p.y = clamp(p.y + p.vy * dt, PLAYER_R, WORLD_H - PLAYER_R);
+      const tx = p.ix * MAX_SPEED;
+      const ty = p.iy * MAX_SPEED;
+      p.x = clamp(p.x + tx * dt + ((p.vx - tx) * k) / ACCEL, PLAYER_R, WORLD_W - PLAYER_R);
+      p.y = clamp(p.y + ty * dt + ((p.vy - ty) * k) / ACCEL, PLAYER_R, WORLD_H - PLAYER_R);
+      p.vx += (tx - p.vx) * k;
+      p.vy += (ty - p.vy) * k;
     }
   }
 
@@ -418,8 +447,26 @@ export class GameRoom extends DurableObject<Env> {
       o: this.orbs.map((o) => [o.id, Math.round(o.x), Math.round(o.y), o.gold ? 1 : 0]),
       f: this.fx.map((f) => [Math.round(f.x), Math.round(f.y), f.gold ? 1 : 0]),
     });
-    for (const ws of this.sessions.keys()) {
+
+    for (const [ws, session] of this.sessions) {
       this.sendRaw(ws, payload);
+
+      // 本人にだけ、自分の正確な位置と「その状態があなたの時計で何時に相当するか」を返す。
+      // クライアントはこれを使い、同じ時点の自分の予測と突き合わせて誤差だけを直す。
+      // 単純に今の予測位置と比べてしまうと通信の遅れをズレと誤認し、
+      // せっかくの先読みを打ち消してしまう。
+      const p = session.player;
+      if (p.clockOffset !== null) {
+        this.sendRaw(
+          ws,
+          JSON.stringify({
+            t: 'me',
+            et: Math.round(now - p.clockOffset),
+            x: Math.round(p.x * 10) / 10,
+            y: Math.round(p.y * 10) / 10,
+          })
+        );
+      }
     }
   }
 

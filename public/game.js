@@ -42,12 +42,18 @@ const touchHint = $('touchHint');
 
 /** 何 ms 過去の状態を描くか。この遅延のぶんだけ補間の余裕が生まれる。 */
 const INTERP_DELAY = 110;
-/** 入力の送信間隔 (ms)。 */
-const INPUT_INTERVAL = 50;
+/** 大きく向きが変えたときの最短送信間隔 (ms)。押した瞬間を待たせない。 */
+const INPUT_MIN_INTERVAL = 12;
+/** 細かく向きが変わり続けるとき (スティック操作) の送信間隔 (ms)。 */
+const INPUT_FINE_INTERVAL = 33;
+/** 向きが変わらないときの送信間隔 (ms)。時計合わせを兼ねている。 */
+const INPUT_HEARTBEAT = 100;
 /** 予測位置がサーバーとこれ以上ズレたら瞬間移動で合わせる。 */
 const SNAP_DISTANCE = 170;
-/** 1 スナップショットあたり、予測位置をサーバー位置へ寄せる割合。 */
+/** 1 回の補正で誤差をどれだけ詰めるか。 */
 const RECONCILE = 0.2;
+/** 予測位置の履歴として持っておくフレーム数 (60fps でおよそ 3 秒)。 */
+const TRAIL_MAX = 180;
 
 const MEDALS = ['🥇', '🥈', '🥉'];
 
@@ -81,6 +87,12 @@ let best = null;
 
 /** 自分の予測位置。 */
 const me = { x: 0, y: 0, vx: 0, vy: 0, ready: false };
+/**
+ * 自分の予測位置の履歴 [{t, x, y}]。
+ * サーバーから届く位置は必ず通信の遅れぶん過去のものなので、
+ * 「その時点で自分はどこにいると思っていたか」と突き合わせるために持つ。
+ */
+const trail = [];
 
 /** 入力状態。 */
 const keys = new Set();
@@ -166,7 +178,13 @@ function handleMessage(msg) {
       best = msg.best;
       me.ready = false;
       snapshots = [];
+      trail.length = 0;
       resize();
+      break;
+    }
+
+    case 'me': {
+      reconcile(msg);
       break;
     }
 
@@ -226,19 +244,12 @@ function onState(msg) {
     burst(x, y, gold === 1);
   }
 
-  // 自分の予測位置をサーバーの位置へ寄せる。
+  // 最初の 1 通で自分の位置を置く。以降の補正は 'me' メッセージで行う。
   const mine = players.get(myId);
-  if (mine) {
-    if (!me.ready) {
-      me.x = mine.x;
-      me.y = mine.y;
-      me.ready = true;
-    } else {
-      const dist = Math.hypot(mine.x - me.x, mine.y - me.y);
-      const k = dist > SNAP_DISTANCE ? 1 : RECONCILE;
-      me.x += (mine.x - me.x) * k;
-      me.y += (mine.y - me.y) * k;
-    }
+  if (mine && !me.ready) {
+    me.x = mine.x;
+    me.y = mine.y;
+    me.ready = true;
   }
 
   renderBoard();
@@ -273,14 +284,23 @@ function updateInput() {
 function sendInput(force) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const now = performance.now();
-  const moved =
-    Math.abs(input.x - lastSentInput.x) > 0.02 || Math.abs(input.y - lastSentInput.y) > 0.02;
-  if (!force && !moved && now - lastInputSent < 200) return;
-  if (!force && now - lastInputSent < INPUT_INTERVAL) return;
+  const change = Math.hypot(input.x - lastSentInput.x, input.y - lastSentInput.y);
+  const since = now - lastInputSent;
+
+  // 向きを変えた瞬間は待たせない。待たせたぶんがそのまま操作の重さになる。
+  // 細かい変化 (スティック操作) は 30Hz、変化がなければ 100ms ごとに送る。
+  const due =
+    change > 0.3
+      ? since >= INPUT_MIN_INTERVAL
+      : change > 0.02
+        ? since >= INPUT_FINE_INTERVAL
+        : since >= INPUT_HEARTBEAT;
+  if (!force && !due) return;
 
   lastInputSent = now;
   lastSentInput = { x: input.x, y: input.y };
-  ws.send(JSON.stringify({ t: 'input', dx: input.x, dy: input.y }));
+  // ts はサーバーが時計の差を測るために使い、'me' メッセージで戻ってくる。
+  ws.send(JSON.stringify({ t: 'input', dx: input.x, dy: input.y, ts: now }));
 }
 
 addEventListener('keydown', (e) => {
@@ -331,12 +351,54 @@ canvas.addEventListener('pointercancel', endTouch);
 
 function predict(dt) {
   if (!me.ready) return;
-  // サーバーと同じ式で動かす (パラメータは welcome で受け取ったもの)。
+
+  // サーバーと同じ解析解で進める。「更新後の速度 × dt」ではなくこの式を使うことで、
+  // 60fps のここと 20Hz のサーバーで進む距離が厳密に一致する。
   const k = 1 - Math.exp(-cfg.accel * dt);
-  me.vx += (input.x * cfg.speed - me.vx) * k;
-  me.vy += (input.y * cfg.speed - me.vy) * k;
-  me.x = clamp(me.x + me.vx * dt, cfg.playerR, cfg.world.w - cfg.playerR);
-  me.y = clamp(me.y + me.vy * dt, cfg.playerR, cfg.world.h - cfg.playerR);
+  const tx = input.x * cfg.speed;
+  const ty = input.y * cfg.speed;
+  me.x = clamp(me.x + tx * dt + ((me.vx - tx) * k) / cfg.accel, cfg.playerR, cfg.world.w - cfg.playerR);
+  me.y = clamp(me.y + ty * dt + ((me.vy - ty) * k) / cfg.accel, cfg.playerR, cfg.world.h - cfg.playerR);
+  me.vx += (tx - me.vx) * k;
+  me.vy += (ty - me.vy) * k;
+
+  trail.push({ t: performance.now(), x: me.x, y: me.y });
+  if (trail.length > TRAIL_MAX) trail.shift();
+}
+
+/**
+ * サーバーから届いた自分の位置で予測を補正する。
+ *
+ * msg.et は「この位置はあなたの時計で何時に相当するか」。同じ時点の自分の予測と
+ * 比べるので、差として出てくるのは通信の遅れではなく本物のズレ (壁ぎわの丸め、
+ * 他プレイヤーとの押し合いなど) だけになる。今の予測位置と直接比べてしまうと
+ * 往復時間ぶんの差をズレと誤認し、先読みを打ち消してしまう。
+ */
+function reconcile(msg) {
+  if (!me.ready || trail.length === 0) return;
+  if (msg.et < trail[0].t) return; // 履歴がまだ足りない
+
+  let past = trail[0];
+  for (const entry of trail) {
+    if (entry.t <= msg.et) past = entry;
+    else break;
+  }
+
+  const ex = msg.x - past.x;
+  const ey = msg.y - past.y;
+  const k = Math.hypot(ex, ey) > SNAP_DISTANCE ? 1 : RECONCILE;
+  const dx = ex * k;
+  const dy = ey * k;
+
+  me.x = clamp(me.x + dx, cfg.playerR, cfg.world.w - cfg.playerR);
+  me.y = clamp(me.y + dy, cfg.playerR, cfg.world.h - cfg.playerR);
+
+  // 履歴も同じだけずらす。ずらさないと、直したはずのズレを次の補正でも
+  // もう一度数えてしまい、何度も同じ補正がかかる。
+  for (const entry of trail) {
+    entry.x += dx;
+    entry.y += dy;
+  }
 }
 
 // ------------------------------------------------------------------ 補間
