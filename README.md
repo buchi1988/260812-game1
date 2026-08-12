@@ -4,6 +4,8 @@
 
 Cloudflare Workers と Durable Objects だけで動きます。データベースも外部サービスも不要です。
 
+実装の詳細（設計の根拠、プロトコル仕様、ネットコードの実測値）は **[技術ドキュメント](docs/architecture.md)** にまとめてあります。
+
 ## 遊び方
 
 1. 名前とルーム名を入れて「ゲームに参加」
@@ -100,6 +102,7 @@ dx = 目標速度 * dt + (今の速度 - 目標速度) * k / ACCEL
 | `public/game.js` | 描画・入力・補間・先読み |
 | `public/style.css` | 見た目 |
 | `test/smoke.mjs` | サーバー側の動作確認 |
+| `docs/architecture.md` | 技術ドキュメント（設計の根拠、プロトコル仕様、実測値） |
 
 ## 調整する
 
